@@ -1,0 +1,156 @@
+
+```{r}
+
+#### Read data ####
+dt = read.csv('final.csv', header = TRUE)
+head(dt)
+
+#### Classify cells into different groups based on their expression profiles ####
+#### Visualize the cells on a two-dimensional UMAP projection and color them by group ####
+
+## create a matrix with all unique gene names as rows and cell IDs as columns
+genes <- unique(dt$geneName)
+cells <- unique(dt$unique_cell_id)
+
+
+M_counts <- matrix(0, nrow = length(genes), ncol = length(cells))
+colnames(M_counts) <- unique(dt$unique_cell_id)
+rownames(M_counts) <- unique(dt$geneName)
+
+## collect gene expression profile for each cell into the matrix
+for (c in 1:ncol(M_counts)) {
+  cell <- colnames(M_counts)[c]
+  gene <- dt[dt$unique_cell_id == cell,][,2]
+  count <- table(gene)
+  M_counts[,c][match(row.names(count), row.names(M_counts))] <- count
+}
+
+## using seurat to analyze data
+library(Seurat)
+merfish_list <- list()
+merfish_list$merfish_obj <- CreateSeuratObject(counts <- M_counts)
+merfish_list$norm_exp <- NormalizeData(merfish_list$merfish_obj,
+                              normalization.method = 'LogNormalize',
+                              scale.factor = 10000)
+merfish_list$variables <- FindVariableFeatures(merfish_list$norm_exp, 
+                                     selection.method = 'vst',
+                                     nfeatures = 100)
+merfish_list$scale_data <- ScaleData(merfish_list$variables)
+merfish_list$pca <- RunPCA(merfish_list$scale_data)
+merfish_list$neighbors <- FindNeighbors(merfish_list$pca, dims = 1:10)
+merfish_list$clusters <- FindClusters(merfish_list$neighbors, resolution = 0.5)
+merfish_list$umap <- RunUMAP(merfish_list$clusters, dims = 1:10)
+DimPlot(merfish_list$umap, reduction = "umap")
+
+#### Measure of a cell's mRNA spatial distribution ####
+#### using the spatial distribution of the gene FLNA as a reference ####
+## collect gene names other than FLNA
+non_f <- dt[which(dt$geneName != 'FLNA'),]
+non_f <- unique(non_f$geneName)
+
+## create a matrix with all unique gene names (except FLNA) as rows and cell IDs as columns
+norm_coloc <- matrix(0, ncol = length(cells), nrow = length(non_f))
+colnames(norm_coloc) <- unique(dt$unique_cell_id)
+rownames(norm_coloc) <- non_f
+
+## iterate raw data to 1) extract by cell id and 2) by gene name
+## then collect the X and Y of that gene molecule as well the reference
+## calculate the distance between two points 
+## and filter out non-neighbors (d < 1 nanometer)
+## finally calculate the total amount of neighbors and store normalized the data in matrix
+
+for (c in 1:length(cells)) {
+  cell_a <- cells[c]
+  for (q in 1:length(non_f)) {
+    gene_a <- non_f[q]
+    other <- dt[dt$unique_cell_id == cell_a & dt$geneName == gene_a,]
+    flna <- dt[dt$unique_cell_id == cell_a & dt$geneName == 'FLNA',]
+    num_gene <- nrow(other)
+    num_flna <- nrow(flna)
+    total <- 0
+    if (nrow(other) > 0 & nrow(flna) > 0) {
+      for (a in 1:nrow(other)) {
+        x1 <- other[,3][a]
+        y1 <- other[,4][a]
+        for (b in 1:nrow(flna)) {
+          x2 <- flna[,3][b]
+          y2 <- flna[,4][b]
+          d <- sqrt((x2-x1)^2+(y2-y1)^2)
+          if (d < 1) {
+            total <- total + 1
+            norm_coloc[gene_a,cell_a] <- total/(num_gene*num_flna)
+        }
+      }
+    }
+  }
+  }
+}
+
+out <- c('ABCA2', 'AFAP1', 'AFF4', 'AGPS')
+print(norm_coloc[out,11:15])
+
+#### Classify cells into groups using the Louvain method on a shared nearest neighbor network constructed from the normalized colocalizations calculated in previous part ####
+#### Then use the normalized colocalizations to calculate a two-dimensional UMAP projection ####
+#### Finally, visualize the cells using their UMAP coordinates and color them by their assigned group ####
+
+#norm_coloc <- read.table("norm_coloc.csv",header=TRUE,row.names=1)
+
+library(umap)
+library(dbscan)
+library(igraph)
+library(ggplot2)
+
+## calculate IQRs
+IQRs <- apply(norm_coloc, 1, IQR)
+
+## find genes with IQRs greater than 0
+names <- rownames(norm_coloc)[IQRs > 0]
+
+## pca
+pca <- prcomp(t(norm_coloc[names,]), center = TRUE, scale. = TRUE)$x[,1:15]
+
+## make snn
+snn <- sNN(pca, k = 20, kt = 3)
+
+## make undirected graph from adjacency list
+g <- graph_from_adj_list(adjacencylist(snn),
+                         mode = 'all',
+                         duplicate = FALSE)
+
+## update to output list
+output <- list()
+output$umap <- umap(pca)$layout
+output$cluster <- as.factor(membership(cluster_louvain(g)))
+
+
+df <- data.frame(output$umap,
+                 cluster <- output$cluster)
+ggplot(data = df) + 
+  geom_point(mapping = aes(x = X1, y = X2, color = cluster))
+
+#### Clustered cells based on their expression profiles ####
+
+df$expression <- merfish_list$clusters$seurat_clusters
+ggplot(data = df) +
+  geom_point(mapping = aes(x = X1, y = X2, color = expression))
+
+#### Figure out how many genes (other than FLNA) is the gene's expression level associated with its normalized colocalization with FLNA ####
+
+num <- 0
+
+## convert norm_coloc to matrix
+norm_coloc <- data.matrix(norm_coloc)
+
+## iterate of non-FLNA genes in both expression profile 
+## and spatial distribution data
+## perform spearman and sum the number of genes with rho > 0.3
+for (gn in non_f) {
+  rho_value <- cor.test(M_counts[gn,], norm_coloc[gn,], method = 'spearman')$estimate
+  if (!is.na(rho_value) & rho_value > 0.3) {
+    num <- num + 1
+  }
+}
+print(num)
+
+
+```
